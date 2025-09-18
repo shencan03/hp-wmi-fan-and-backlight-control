@@ -32,6 +32,9 @@
 #include <linux/dmi.h>
 #include <linux/leds.h>
 #include <linux/led-class-multicolor.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
 MODULE_DESCRIPTION("HP laptop WMI driver");
@@ -55,6 +58,13 @@ MODULE_ALIAS("wmi:5FB7F034-2C63-45E9-BE91-3D44E2C707E4");
 #define HP_BACKLIGHT_ON 0xE4
 
 #define ACPI_AC_CLASS "ac_adapter"
+
+#define HP_FAN_DYNAMIC_UPDATE_INTERVAL_MS 2000
+#define HP_CPU_TEMP_HWMON_PATH "/sys/class/hwmon/hwmon5/temp1_input"
+#define HP_FAN1_MIN_RPM 2100
+#define HP_FAN1_MAX_RPM 5800
+#define HP_FAN2_MIN_RPM 2100
+#define HP_FAN2_MAX_RPM 6100
 
 #define zero_if_sup(tmp) (zero_insize_support?0:sizeof(tmp)) // use when zero insize is required
 
@@ -280,13 +290,22 @@ enum hp_keyboard_type {
 enum hp_fan_control_mode {
 	HP_FAN_MODE_MAX = 0,
 	HP_FAN_MODE_MANUAL = 1,
-	HP_FAN_MODE_AUTOMATIC = 2
+	HP_FAN_MODE_AUTOMATIC = 2,
+	HP_FAN_MODE_DYNAMIC = 3
+};
+
+struct temp_fan_point {
+	int temp;
+	int rpm;
 };
 
 struct hp_fan_control {
 	bool have_manual_control;
 	enum hp_fan_control_mode mode;
 	int max_rpms[2];
+	int current_fan_rpms[2];
+	struct delayed_work dynamic_work;
+	bool dynamic_enabled;
 };
 
 struct hp_mc_leds {
@@ -357,6 +376,26 @@ static enum platform_profile_option active_platform_profile;
 static bool force_fan_control_support;
 static bool platform_profile_support;
 static bool zero_insize_support;
+
+/* Temperature-fan curve for fan1 (lower max RPM) */
+static struct temp_fan_point cpu_fan1_curve[] = {
+	{40, 2100},   /* 40°C: minimum RPM */
+	{50, 2500},   /* 50°C: low speed */
+	{60, 3200},   /* 60°C: moderate speed */
+	{70, 4000},   /* 70°C: high speed */
+	{80, 4800},   /* 80°C: very high speed (LLM workload) */
+	{90, 5800},   /* 90°C+: maximum speed for fan1 */
+};
+
+/* Temperature-fan curve for fan2 (higher max RPM) */
+static struct temp_fan_point cpu_fan2_curve[] = {
+	{40, 2100},   /* 40°C: minimum RPM */
+	{50, 2600},   /* 50°C: low speed */
+	{60, 3400},   /* 60°C: moderate speed */
+	{70, 4200},   /* 70°C: high speed */
+	{80, 5100},   /* 80°C: very high speed (LLM workload) */
+	{90, 6100},   /* 90°C+: maximum speed for fan2 */
+};
 
 module_param(force_fan_control_support, bool, 0444);
 MODULE_PARM_DESC(force_fan_control_support, "Force fan control support");
@@ -738,6 +777,77 @@ static int hp_wmi_set_fan_speed(int fan, int fan_speed)
 	return ret;
 }
 
+static int hp_wmi_set_both_fan_speeds(int fan1_speed, int fan2_speed)
+{
+	u8 fans_speed[2] = { fan1_speed / 100, fan2_speed / 100 };
+	int ret;
+
+	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
+				   &fans_speed, sizeof(fans_speed), 0);
+
+	return ret;
+}
+
+static int hp_wmi_read_cpu_temp(void)
+{
+	struct file *f;
+	char temp_str[16];
+	int temp_millidegree;
+	loff_t pos = 0;
+	ssize_t bytes_read;
+
+	f = filp_open(HP_CPU_TEMP_HWMON_PATH, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		pr_warn("hp-wmi: Failed to open CPU temperature file: %ld\n", PTR_ERR(f));
+		return -ENOENT;
+	}
+
+	bytes_read = kernel_read(f, temp_str, sizeof(temp_str) - 1, &pos);
+	filp_close(f, NULL);
+
+	if (bytes_read <= 0) {
+		pr_warn("hp-wmi: Failed to read CPU temperature\n");
+		return -EIO;
+	}
+
+	temp_str[bytes_read] = '\0';
+	if (kstrtoint(temp_str, 10, &temp_millidegree) != 0) {
+		pr_warn("hp-wmi: Failed to parse CPU temperature\n");
+		return -EINVAL;
+	}
+
+	/* Convert from millidegree to degree Celsius */
+	return temp_millidegree / 1000;
+}
+
+static int hp_wmi_interpolate_fan_speed(struct temp_fan_point *curve, int curve_size, int temp)
+{
+	int i;
+
+	/* Temperature below minimum curve point */
+	if (temp <= curve[0].temp)
+		return curve[0].rpm;
+
+	/* Temperature above maximum curve point */
+	if (temp >= curve[curve_size - 1].temp)
+		return curve[curve_size - 1].rpm;
+
+	/* Find the two points to interpolate between */
+	for (i = 0; i < curve_size - 1; i++) {
+		if (temp >= curve[i].temp && temp < curve[i + 1].temp) {
+			int temp_diff = curve[i + 1].temp - curve[i].temp;
+			int rpm_diff = curve[i + 1].rpm - curve[i].rpm;
+			int temp_offset = temp - curve[i].temp;
+
+			/* Linear interpolation */
+			return curve[i].rpm + (rpm_diff * temp_offset) / temp_diff;
+		}
+	}
+
+	/* Should not reach here, but return max RPM as fallback */
+	return curve[curve_size - 1].rpm;
+}
+
 static int hp_wmi_fan_speed_max_reset(void)
 {
 	int ret;
@@ -751,11 +861,94 @@ static int hp_wmi_fan_speed_max_reset(void)
 	return ret;
 }
 
+static void hp_wmi_dynamic_fan_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct hp_fan_control *fan_control = container_of(dwork, struct hp_fan_control, dynamic_work);
+	int cpu_temp, fan1_target, fan2_target;
+
+	/* Only run if dynamic mode is enabled */
+	if (!fan_control->dynamic_enabled || fan_control->mode != HP_FAN_MODE_DYNAMIC)
+		return;
+
+	cpu_temp = hp_wmi_read_cpu_temp();
+	if (cpu_temp < 0) {
+		pr_warn("hp-wmi: Failed to read CPU temperature, retrying in %d ms\n", 
+			HP_FAN_DYNAMIC_UPDATE_INTERVAL_MS);
+		goto reschedule;
+	}
+
+	/* Calculate target fan speeds based on temperature curves */
+	fan1_target = hp_wmi_interpolate_fan_speed(cpu_fan1_curve, 
+						   ARRAY_SIZE(cpu_fan1_curve), 
+						   cpu_temp);
+	fan2_target = hp_wmi_interpolate_fan_speed(cpu_fan2_curve, 
+						   ARRAY_SIZE(cpu_fan2_curve), 
+						   cpu_temp);
+
+	/* Only update if speed has changed significantly (avoid constant adjustments) */
+	if (abs(fan1_target - fan_control->current_fan_rpms[0]) >= 100 ||
+	    abs(fan2_target - fan_control->current_fan_rpms[1]) >= 100) {
+		
+		if (is_victus_s_thermal_profile())
+			hp_wmi_get_fan_count_userdefine_trigger();
+
+		if (hp_wmi_set_both_fan_speeds(fan1_target, fan2_target) == 0) {
+			fan_control->current_fan_rpms[0] = fan1_target;
+			fan_control->current_fan_rpms[1] = fan2_target;
+			pr_debug("hp-wmi: Dynamic fan control: CPU %d°C -> Fan1: %d RPM, Fan2: %d RPM\n",
+				cpu_temp, fan1_target, fan2_target);
+		} else {
+			pr_warn("hp-wmi: Failed to set dynamic fan speeds\n");
+		}
+	}
+
+reschedule:
+	if (fan_control->dynamic_enabled && fan_control->mode == HP_FAN_MODE_DYNAMIC) {
+		schedule_delayed_work(&fan_control->dynamic_work, 
+				      msecs_to_jiffies(HP_FAN_DYNAMIC_UPDATE_INTERVAL_MS));
+	}
+}
+
+static int hp_wmi_start_dynamic_fan_control(void)
+{
+	if (!hp_fan_control.have_manual_control) {
+		pr_warn("hp-wmi: Manual fan control not available, cannot enable dynamic mode\n");
+		return -ENOTSUPP;
+	}
+
+	cancel_delayed_work_sync(&hp_fan_control.dynamic_work);
+	
+	hp_fan_control.mode = HP_FAN_MODE_DYNAMIC;
+	hp_fan_control.dynamic_enabled = true;
+	hp_fan_control.current_fan_rpms[0] = HP_FAN1_MIN_RPM;
+	hp_fan_control.current_fan_rpms[1] = HP_FAN2_MIN_RPM;
+
+	/* Start the work immediately */
+	schedule_delayed_work(&hp_fan_control.dynamic_work, 0);
+	
+	pr_info("hp-wmi: Dynamic fan control started\n");
+	return 0;
+}
+
+static void hp_wmi_stop_dynamic_fan_control(void)
+{
+	hp_fan_control.dynamic_enabled = false;
+	cancel_delayed_work_sync(&hp_fan_control.dynamic_work);
+	pr_info("hp-wmi: Dynamic fan control stopped\n");
+}
+
 
 static int __init hp_wmi_manual_fan_init(void)
 {
 	hp_fan_control.mode = HP_FAN_MODE_AUTOMATIC;
 	hp_fan_control.have_manual_control = is_manual_fan_control_board();
+	hp_fan_control.dynamic_enabled = false;
+	hp_fan_control.current_fan_rpms[0] = HP_FAN1_MIN_RPM;
+	hp_fan_control.current_fan_rpms[1] = HP_FAN2_MIN_RPM;
+
+	/* Initialize the workqueue for dynamic fan control */
+	INIT_DELAYED_WORK(&hp_fan_control.dynamic_work, hp_wmi_dynamic_fan_work);
 
 	if (!hp_fan_control.have_manual_control) {
 		return -ENOTTY;
@@ -2430,6 +2623,23 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 		case hwmon_fan_max:
 			*val = hp_fan_control.max_rpms[channel];
 			break;
+		case hwmon_fan_target:
+			if (hp_fan_control.mode == HP_FAN_MODE_DYNAMIC) {
+				*val = hp_fan_control.current_fan_rpms[channel];
+			} else if (hp_fan_control.mode == HP_FAN_MODE_MANUAL) {
+				/* For manual mode, read the actual target from hardware */
+				if (is_victus_s_thermal_profile()) {
+					ret = hp_wmi_get_fan_speed_victus_s(channel);
+				} else {
+					ret = hp_wmi_get_fan_speed(channel);
+				}
+				if (ret < 0)
+					return ret;
+				*val = ret;
+			} else {
+				return -EINVAL;
+			}
+			break;
 		default:
 			return -EINVAL;
 		}
@@ -2448,6 +2658,9 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 		case HP_FAN_MODE_AUTOMATIC:
 			*val = 2;
 			return 0;
+		case HP_FAN_MODE_DYNAMIC:
+			*val = 3;
+			return 0;
 		default:
 			/* shouldn't happen */
 			return -ENODATA;
@@ -2465,20 +2678,25 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 	case hwmon_pwm:
 		switch (val) {
 		case 0:
+			hp_wmi_stop_dynamic_fan_control();
 			hp_fan_control.mode = HP_FAN_MODE_MAX;
 			if (is_victus_s_thermal_profile())
 				hp_wmi_get_fan_count_userdefine_trigger();
 			return hp_wmi_fan_speed_max_set(1);
 		case 1:
+			hp_wmi_stop_dynamic_fan_control();
 			hp_fan_control.mode = HP_FAN_MODE_MANUAL;
 			return 0;
 		case 2:
+			hp_wmi_stop_dynamic_fan_control();
 			hp_fan_control.mode = HP_FAN_MODE_AUTOMATIC;
 			if (is_victus_s_thermal_profile()) {
 				hp_wmi_get_fan_count_userdefine_trigger();
 				return hp_wmi_fan_speed_max_reset();
 			} else
 				return hp_wmi_fan_speed_max_set(0);
+		case 3:
+			return hp_wmi_start_dynamic_fan_control();
 		default:
 			return -EINVAL;
 		}
@@ -2487,6 +2705,10 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 		if (val > hp_fan_control.max_rpms[channel] && !force_fan_control_support)
 			return -EINVAL;
 		if (hp_fan_control.have_manual_control) {
+			/* Stop dynamic mode if it's running */
+			if (hp_fan_control.mode == HP_FAN_MODE_DYNAMIC)
+				hp_wmi_stop_dynamic_fan_control();
+			
 			if (is_victus_s_thermal_profile())
 				hp_wmi_get_fan_count_userdefine_trigger();
 			hp_fan_control.mode = HP_FAN_MODE_MANUAL;
@@ -2589,6 +2811,9 @@ module_init(hp_wmi_init);
 
 static void __exit hp_wmi_exit(void)
 {
+	/* Stop dynamic fan control if running */
+	hp_wmi_stop_dynamic_fan_control();
+
 	if (is_omen_thermal_profile() || is_victus_thermal_profile())
 		omen_unregister_powersource_event_handler();
 
