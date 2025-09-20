@@ -377,24 +377,28 @@ static bool force_fan_control_support;
 static bool platform_profile_support;
 static bool zero_insize_support;
 
-/* Temperature-fan curve for fan1 (lower max RPM) */
+/* fan1: max 5800 */
 static struct temp_fan_point cpu_fan1_curve[] = {
-	{40, 2100},   /* 40°C: minimum RPM */
-	{50, 2500},   /* 50°C: low speed */
-	{60, 3200},   /* 60°C: moderate speed */
-	{70, 4000},   /* 70°C: high speed */
-	{80, 4800},   /* 80°C: very high speed (LLM workload) */
-	{90, 5800},   /* 90°C+: maximum speed for fan1 */
+    {40, 2200},
+    {55, 3200},
+    {65, 4200},
+    {70, 5000},
+    {75, 5600},
+    {80, 5800},  // hit max by 80°C
+    {85, 5800},
+    {90, 5800},
 };
 
-/* Temperature-fan curve for fan2 (higher max RPM) */
+/* fan2: max 6100 */
 static struct temp_fan_point cpu_fan2_curve[] = {
-	{40, 2100},   /* 40°C: minimum RPM */
-	{50, 2600},   /* 50°C: low speed */
-	{60, 3400},   /* 60°C: moderate speed */
-	{70, 4200},   /* 70°C: high speed */
-	{80, 5100},   /* 80°C: very high speed (LLM workload) */
-	{90, 6100},   /* 90°C+: maximum speed for fan2 */
+    {40, 2200},
+    {55, 3300},
+    {65, 4400},
+    {70, 5200},
+    {75, 5900},
+    {80, 6100},  // hit max by 80°C
+    {85, 6100},
+    {90, 6100},
 };
 
 module_param(force_fan_control_support, bool, 0444);

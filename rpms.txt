@@ -1,0 +1,8 @@
+[fan1_target] #cpu
+min = 1800
+max = 5800
+[fan2_target] #gpu
+min = 2100
+max = 6100
+
+#intervals of 100rpms are valid from min through max for each fan
