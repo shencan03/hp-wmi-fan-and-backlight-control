@@ -1,0 +1,11 @@
+[Unit]
+Description=HP Dynamic Fan Control
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo 3 > /sys/devices/platform/hp-wmi/hwmon/hwmon*/pwm1_enable'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
